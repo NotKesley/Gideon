@@ -1,0 +1,504 @@
+import os
+import sys
+import time
+import json
+import queue
+import threading
+import webbrowser
+import subprocess
+import datetime
+import traceback
+from pathlib import Path
+
+import sounddevice as sd
+import numpy as np
+from vosk import Model, KaldiRecognizer
+
+import pyttsx3
+import pywhatkit
+import pyautogui
+import requests
+
+# Optional integrations
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyOAuth
+    SPOTIFY_AVAILABLE = True
+except Exception:
+    SPOTIFY_AVAILABLE = False
+
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
+# ----------------------
+# CONFIG
+# ----------------------
+VOSK_MODEL_PATH = r"c:\Users\kesle\OneDrive\Documents\Gidion\vosk-model-small-en-us-0.15"
+SAMPLE_RATE = 16000
+WAKE_RMS_THRESHOLD = 0.02
+WAKE_CHECK_DURATION = 0.6   # retained for compatibility (not used for blocking read)
+COMMAND_DURATION = 4.0
+SPOTIFY_SCOPE = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
+
+# Keys
+WEATHER_API_KEY = "743ab9cdd3ada88068e47932e07d7d31"
+OPENAI_API_KEY = ""
+SPOTIFY_CLIENT_ID = "4aabf94cc6e4408c97330c82bf097453"
+SPOTIFY_CLIENT_SECRET = "2ac20e6d5c374da687d0ce73e261f961"
+SPOTIFY_REDIRECT_URI = "https://medium.com/@stefmaxko/spotify-auth-flow-with-node-js-express-7ff13d72565a"
+
+# ----------------------
+# GLOBALS
+# ----------------------
+engine = pyttsx3.init()
+recognizer = None
+vosk_model = None
+wake_queue = queue.Queue()
+stop_event = threading.Event()
+session_memory = []
+personality = "confident"
+spotify_client = None
+tts_queue = queue.Queue()  # Fixed: dedicated TTS queue
+tts_thread = None
+
+# ----------------------
+# TTS setup
+# ----------------------
+def choose_male_voice():
+    voices = engine.getProperty("voices")
+    chosen = None
+    for v in voices:
+        name = (v.name or "").lower()
+        if any(k in name for k in ("male","david","alex","michael","daniel","jon")):
+            chosen = v.id
+            break
+    if not chosen and voices:
+        chosen = voices[0].id
+    if chosen:
+        engine.setProperty("voice", chosen)
+    engine.setProperty("rate", 160)
+
+choose_male_voice()
+
+def tts_worker():
+    while True:
+        text = tts_queue.get()
+        if text is None:
+            break
+        try:
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as e:
+            print("TTS worker error:", e)
+
+def say(text, block=False):
+    print("[GIDEON]:", text)
+    # If caller requests blocking TTS, speak synchronously on the main thread.
+    if block:
+        try:
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as e:
+            print("TTS direct play error:", e)
+        return
+    # Otherwise enqueue for the TTS worker.
+    tts_queue.put(text)
+
+# Start TTS worker once
+tts_thread = threading.Thread(target=tts_worker, daemon=True)
+tts_thread.start()
+
+# ----------------------
+# Load Vosk model
+# ----------------------
+def load_vosk():
+    global vosk_model, recognizer
+    if not os.path.isdir(VOSK_MODEL_PATH):
+        print(f"VOSK model folder not found at '{VOSK_MODEL_PATH}'.")
+        sys.exit(1)
+    say("Loading speech model... please wait.")
+    try:
+        vosk_model = Model(VOSK_MODEL_PATH)
+        recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+    except Exception as e:
+        print("Vosk load error:", e)
+        say("Error loading speech model.")
+        sys.exit(1)
+    say("Speech model loaded.")
+
+# ----------------------
+# Audio helpers
+# ----------------------
+def rms(arr: np.ndarray) -> float:
+    if arr.size == 0:
+        return 0.0
+    if arr.dtype == np.int16:
+        a = arr.astype(np.float32)/32767.0
+    else:
+        a = arr.astype(np.float32)
+    return float(np.sqrt(np.mean(a*a)))
+
+def transcribe_bytes(audio_bytes: bytes) -> str:
+    rec = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+    ok = rec.AcceptWaveform(audio_bytes)
+    res = rec.Result() if ok else rec.PartialResult()
+    try:
+        data = json.loads(res)
+        return data.get("text","").strip()
+    except Exception:
+        return ""
+
+def record_seconds(seconds: float) -> np.ndarray:
+    try:
+        return np.squeeze(sd.rec(int(seconds*SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='int16', blocking=True))
+    except Exception as e:
+        print("Audio capture error:", e)
+        return np.array([], dtype='int16')
+
+def Listen(seconds=3) -> str:
+    audio = record_seconds(seconds)
+    if audio.size == 0:
+        return ""
+    return transcribe_bytes(audio.tobytes()).lower().strip()
+
+# ----------------------
+# Wake loop (REPLACED - real-time incremental recognizer)
+# ----------------------
+def wake_loop():
+    """
+    Real-time wake loop that reads small frames and feeds a single recognizer,
+    checking both partial and final results for 'gideon'.
+    """
+    say("Wake listener starting.")
+    # We'll create a dedicated recognizer instance here for wake detection
+    rec = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+    rec.SetWords(False)  # optional: speed up results
+
+    # Use a small frame size (0.2s) so partial results are frequent
+    frame_duration = 0.2
+    frame_size = int(frame_duration * SAMPLE_RATE)
+
+    try:
+        with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=frame_size, dtype='int16', channels=1) as stream:
+            while not stop_event.is_set():
+                try:
+                    # read returns (data, overflow) for RawInputStream.read; use read(frame_size)
+                    data, overflow = stream.read(frame_size)
+                    if overflow:
+                        # if overflow occurs, let it continue
+                        pass
+                    if data is None:
+                        continue
+                    audio_bytes = data.tobytes()
+                    # feed chunk to recognizer
+                    if rec.AcceptWaveform(audio_bytes):
+                        # final result
+                        res = json.loads(rec.Result())
+                        text = res.get("text", "")
+                        if text and "gideon" in text.lower():
+                            wake_queue.put(True)
+                            # debounce a short time to avoid immediate re-triggers
+                            time.sleep(0.5)
+                    else:
+                        # partial result - faster detection for short wake words
+                        pres = json.loads(rec.PartialResult())
+                        partial = pres.get("partial", "")
+                        if partial and "gideon" in partial.lower():
+                            wake_queue.put(True)
+                            time.sleep(0.5)
+                except Exception as e_inner:
+                    # transient audio/read error — don't crash the loop
+                    print("Wake loop read error:", e_inner)
+                    time.sleep(0.1)
+    except Exception as e:
+        print("Wake loop stream error:", e)
+        say("Microphone stream error. Check your audio device.")
+        time.sleep(0.5)
+
+# ----------------------
+# Weather
+# ----------------------
+def GetWeather(city):
+    if not WEATHER_API_KEY:
+        say("Weather API key not set.")
+        return
+    try:
+        url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric"
+        r = requests.get(url, timeout=8)
+        data = r.json()
+        if data.get("cod") != 200:
+            say("Location not found.")
+            return
+        temp = data["main"]["temp"]
+        feels = data["main"]["feels_like"]
+        desc = data["weather"][0]["description"]
+        say(f"The weather in {city} is {desc} with temperature {temp}°C. Feels like {feels}°C.")
+    except Exception as e:
+        print("Weather error:", e)
+        say("Error fetching weather.")
+
+# ----------------------
+# Spotify functions
+# ----------------------
+def spotify_connect():
+    global spotify_client
+    if not SPOTIFY_AVAILABLE:
+        say("Spotify not installed; using YouTube fallback.")
+        return False
+    try:
+        spotify_client = spotipy.Spotify(auth_manager=SpotifyOAuth(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
+            redirect_uri=SPOTIFY_REDIRECT_URI,
+            scope=SPOTIFY_SCOPE
+        ))
+        say("Spotify connected.")
+        return True
+    except Exception as e:
+        print("Spotify connect error:", e)
+        say("Could not connect to Spotify.")
+        return False
+
+def spotify_play(query):
+    if not SPOTIFY_AVAILABLE:
+        say("Spotify unavailable; opening YouTube.")
+        pywhatkit.playonyt(query)
+        return
+    if not spotify_client:
+        if not spotify_connect():
+            pywhatkit.playonyt(query)
+            return
+    try:
+        results = spotify_client.search(q=query, type="track", limit=1)
+        items = results.get("tracks", {}).get("items", [])
+        if items:
+            uri = items[0]["uri"]
+            spotify_client.start_playback(uris=[uri])
+            say(f"Playing {items[0]['name']} on Spotify.")
+        else:
+            say("No track found; opening YouTube.")
+            pywhatkit.playonyt(query)
+    except Exception as e:
+        print("Spotify play error:", e)
+        pywhatkit.playonyt(query)
+        say("Playing on YouTube instead.")
+
+def spotify_pause():
+    try:
+        if spotify_client:
+            spotify_client.pause_playback()
+        else:
+            pyautogui.press("space")
+        say("Playback paused.")
+    except Exception as e:
+        print("Spotify pause error:", e)
+        pyautogui.press("space")
+        say("Playback paused.")
+
+# ----------------------
+# OpenAI / AI fallback
+# ----------------------
+def get_ai_response(prompt):
+    if OPENAI_AVAILABLE and OPENAI_API_KEY:
+        try:
+            openai.api_key = OPENAI_API_KEY
+            comp = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role":"system","content":"You are Gideon, a confident assistant."},
+                    {"role":"user","content":prompt}
+                ],
+                max_tokens=250,
+                temperature=0.7
+            )
+            return comp.choices[0].message.content.strip()
+        except Exception as e:
+            print("OpenAI error:", e)
+    # Local fallback
+    p = prompt.lower()
+    if "time" in p:
+        return f"The time is {datetime.datetime.now().strftime('%I:%M %p')}"
+    if "your name" in p or "who are you" in p:
+        return "I'm Gideon, your confident assistant."
+    if "joke" in p:
+        return "Why do programmers prefer dark mode? Because light attracts bugs."
+    return "I can run commands and open apps. For richer answers add an OpenAI API key."
+
+# ----------------------
+# Command processing
+# ----------------------
+def process_command_text(text):
+    if not text:
+        say("I didn't hear anything.")
+        return
+    t = text.lower().strip()
+
+    # Weather
+    if "weather in" in t:
+        city = t.split("weather in",1)[1].strip()
+        if city: GetWeather(city)
+        return
+    if any(k in t for k in ("what's the weather","what is the weather")):
+        say("Which city?")
+        city = Listen(4)
+        if city: GetWeather(city)
+        return
+
+    # Music
+    if t.startswith("play spotify") or ("play" in t and "spotify" in t):
+        q = t.replace("play spotify","").replace("spotify","").replace("play","").strip()
+        spotify_play(q or "top hits")
+        return
+    if t.startswith("play"):
+        q = t.replace("play","",1).strip()
+        if SPOTIFY_AVAILABLE:
+            spotify_play(q)
+        else:
+            pywhatkit.playonyt(q)
+        return
+    if any(k in t for k in ("pause","stop music")):
+        spotify_pause()
+        return
+
+    # System
+    if t.startswith("open "):
+        target = t.replace("open ","",1).strip()
+        mapping = {
+            "notepad":"notepad",
+            "chrome":r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "discord":r"C:\Users\%USERNAME%\AppData\Local\Discord\Update.exe",
+            "calculator":"calc",
+            "explorer":"explorer",
+            "steam":r"C:\Program Files (x86)\Steam\steam.exe"
+        }
+        for key,path in mapping.items():
+            if key in target:
+                try: subprocess.Popen(path, shell=True); say(f"Opening {key}."); return
+                except: pass
+        if target.startswith("http"):
+            webbrowser.open(target)
+            say("Opening website."); return
+        try: os.startfile(target); say("Opened."); return
+        except: say("Couldn't find that app or file."); return
+
+    if t.startswith("close ") or t.startswith("kill "):
+        target = t.replace("close ","").replace("kill ","").strip()
+        procname = target if target.endswith(".exe") else target+".exe"
+        os.system(f"taskkill /im {procname} /f")
+        say(f"Attempted to close {target}.")
+        return
+
+    if "screenshot" in t:
+        path = Path.cwd()/f"screenshot_{int(time.time())}.png"
+        pyautogui.screenshot().save(path)
+        say(f"Saved screenshot as {path.name}")
+        return
+
+    if t.startswith("type "):
+        to_type = t.replace("type ","",1)
+        pyautogui.write(to_type,interval=0.02)
+        say("Typed that."); return
+
+    if "volume up" in t:
+        for _ in range(5): pyautogui.press("volumeup")
+        say("Volume increased."); return
+    if "volume down" in t:
+        for _ in range(5): pyautogui.press("volumedown")
+        say("Volume decreased."); return
+    if "mute" in t:
+        pyautogui.press("volumemute")
+        say("Muted."); return
+
+    if "timer" in t:
+        import re
+        m = re.search(r"(\d+)\s*(second|seconds|minute|minutes|hour|hours)",t)
+        if not m: say("Tell me how long."); return
+        amount,unit=int(m.group(1)),m.group(2)
+        seconds = amount * (3600 if "hour" in unit else 60 if "minute" in unit else 1)
+        say(f"Setting timer for {amount} {unit}.")
+        threading.Thread(target=lambda s: (time.sleep(s),say("Timer done.")),args=(seconds,),daemon=True).start()
+        return
+
+    if any(k in t for k in ("shutdown","turn off computer")):
+        say("Are you sure? Say yes to confirm.")
+        confirm = Listen(3)
+        if "yes" in confirm:
+            say("Shutting down. Goodbye."); os.system("shutdown /s /t 3")
+        else: say("Shutdown cancelled."); return
+
+    # Personality
+    if "personality" in t or "set personality to" in t:
+        for p in ("neutral","calm","happy","angry","sarcastic","confident"):
+            if p in t:
+                if p=="confident": engine.setProperty("rate",160)
+                else: rates={"neutral":170,"calm":150,"happy":190,"angry":210,"sarcastic":160}
+                engine.setProperty("rate",rates.get(p,170))
+                say(f"Personality set to {p}"); return
+        say("Available personalities: neutral, calm, happy, angry, sarcastic, confident."); return
+
+    # Fallback AI
+    say("Thinking...")
+    resp = get_ai_response(text)
+    say(resp)
+    session_memory.append(("assistant",resp))
+
+# ----------------------
+# Wake handler
+# ----------------------
+def main_wake_handler():
+    say("Gideon ready. Say 'Gideon' to wake me.")
+    while not stop_event.is_set():
+        try:
+            awakened = wake_queue.get(timeout=1)
+            if awakened:
+                say("Yes?", block=True)
+                audio = record_seconds(COMMAND_DURATION)
+                text = transcribe_bytes(audio.tobytes())
+                print("Command:", text)
+                if not text: say("I didn't catch that."); continue
+                process_command_text(text)
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print("Wake handler exception:", e)
+            traceback.print_exc()
+            time.sleep(0.5)
+
+# ----------------------
+# Start/Stop
+# ----------------------
+wake_thread = None
+handler_thread = None
+
+def start_system():
+    global wake_thread, handler_thread
+    load_vosk()
+    say("Initializing Gideon.")
+    if SPOTIFY_AVAILABLE:
+        try: spotify_connect()
+        except Exception as e: print("Spotify auto-connect failed:", e)
+    stop_event.clear()
+    wake_thread = threading.Thread(target=wake_loop, daemon=True)
+    handler_thread = threading.Thread(target=main_wake_handler, daemon=True)
+    wake_thread.start()
+    handler_thread.start()
+    say("Gideon started.")
+
+def stop_system():
+    stop_event.set()
+    # Speak the stopping message, then signal the TTS worker to exit.
+    say("Stopping Gideon.")
+    tts_queue.put(None)
+    time.sleep(0.5)
+
+if __name__=="__main__":
+    try:
+        start_system()
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("Exiting...")
+        stop_system()
