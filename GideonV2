@@ -1,0 +1,405 @@
+# gideon_v3.py
+import os
+import time
+import queue
+import threading
+import webbrowser
+import datetime
+import subprocess
+import traceback
+
+import numpy as np
+import sounddevice as sd
+import speech_recognition as sr
+import pyttsx3
+
+# Optional libs
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyOAuth
+    SPOTIFY_AVAILABLE = True
+except Exception:
+    SPOTIFY_AVAILABLE = False
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except Exception:
+    CV2_AVAILABLE = False
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
+
+# ----------------------------
+# Config
+# ----------------------------
+SAMPLE_RATE = 16000
+LISTEN_DURATION = 2.0   # seconds for each short capture used by VAD
+WAKE_RMS_THRESHOLD = 0.02  # adjust to your mic sensitivity (lower -> more sensitive)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_API_KEY and OPENAI_AVAILABLE:
+    openai.api_key = OPENAI_API_KEY
+
+# ----------------------------
+# Engine + recognizer
+# ----------------------------
+engine = pyttsx3.init()
+recognizer = sr.Recognizer()
+
+# Basic personalities (affect TTS rate/pitch and system prompt)
+PERSONALITIES = {
+    "neutral": {"rate": 170, "pitch": 50, "prompt_prefix": "You are Gideon, a neutral helpful assistant.\n"},
+    "calm":    {"rate": 150, "pitch": 30, "prompt_prefix": "You are Gideon, calm and soothing.\n"},
+    "happy":   {"rate": 190, "pitch": 80, "prompt_prefix": "You are Gideon, upbeat and friendly.\n"},
+    "angry":   {"rate": 210, "pitch": 20, "prompt_prefix": "You are Gideon, terse and blunt.\n"},
+    "sarcastic": {"rate": 160, "pitch": 60, "prompt_prefix": "You are Gideon, slightly sarcastic but helpful.\n"},
+}
+
+current_personality = "neutral"
+
+def set_personality(name):
+    global current_personality
+    if name not in PERSONALITIES:
+        name = "neutral"
+    current_personality = name
+    p = PERSONALITIES[name]
+    engine.setProperty("rate", p["rate"])
+    # pyttsx3 has no direct pitch setter on all platforms; we'll try via voice properties if available
+    # but changing pitch is platform-dependent — rate is reliable.
+
+# initialize personality
+set_personality("neutral")
+
+def speak(text):
+    print("GIDEON:", text)
+    try:
+        engine.say(text)
+        engine.runAndWait()
+    except Exception as e:
+        print("TTS error:", e)
+
+# ----------------------------
+# Simple VAD-based wake-word detector (energy)
+# ----------------------------
+def rms(y):
+    return np.sqrt(np.mean(np.square(y), dtype=np.float64))
+
+def listen_frame(duration=LISTEN_DURATION, sr_rate=SAMPLE_RATE):
+    """Record short frame and return numpy array float32"""
+    try:
+        data = sd.rec(int(duration * sr_rate), samplerate=sr_rate, channels=1, dtype='float32')
+        sd.wait()
+        return np.squeeze(data)
+    except Exception as e:
+        print("Microphone capture error:", e)
+        return np.array([])
+
+# Blocking function that returns transcribed text from a short recording
+def transcribe_short(duration=4):
+    audio = listen_frame(duration=duration)
+    if audio.size == 0:
+        return ""
+    try:
+        audio_int16 = (audio * 32767).astype(np.int16).tobytes()
+        audio_data = sr.AudioData(audio_int16, SAMPLE_RATE, 2)
+        res = recognizer.recognize_google(audio_data, show_all=True)
+        if isinstance(res, dict) and "alternative" in res:
+            best = max(res["alternative"], key=lambda x: x.get("confidence", 0))
+            return best.get("transcript","").lower()
+        return ""
+    except Exception:
+        return ""
+
+# Main wake loop (non-blocking via thread)
+wake_queue = queue.Queue()
+stop_threads = threading.Event()
+
+def wake_loop():
+    while not stop_threads.is_set():
+        frame = listen_frame(duration=0.8)
+        if frame.size == 0:
+            time.sleep(0.2)
+            continue
+        level = rms(frame)
+        # debug: print("RMS", level)
+        if level > WAKE_RMS_THRESHOLD:
+            # louder sound detected — try quick transcription to detect wake-word
+            txt = transcribe_short(duration=2.0)
+            if txt:
+                print("Transcribed (wake-check):", txt)
+                if "gideon" in txt or "hey gideon" in txt or "hey" in txt:
+                    wake_queue.put(True)
+        time.sleep(0.1)
+
+# ----------------------------
+# ChatGPT style conversation (optional OpenAI)
+# ----------------------------
+def chat_with_gpt(prompt, personality=current_personality, max_tokens=256):
+    prefix = PERSONALITIES.get(personality, PERSONALITIES["neutral"])["prompt_prefix"]
+    system_prompt = prefix + "Answer concisely and helpfully.\n"
+    if OPENAI_API_KEY and OPENAI_AVAILABLE:
+        try:
+            completion = openai.ChatCompletion.create(
+                model="gpt-4o-mini",  # change to a model you have access to or "gpt-4o-mini"
+                messages=[
+                    {"role":"system", "content": system_prompt},
+                    {"role":"user", "content": prompt}
+                ],
+                max_tokens=max_tokens,
+                temperature=0.7
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            print("OpenAI request failed:", e)
+            # fallback to local
+    # local fallback (canned / simple)
+    return fallback_chat(prompt, personality)
+
+def fallback_chat(prompt, personality):
+    # Very simple heuristic responses if no OpenAI key
+    if "time" in prompt:
+        return f"The current time is {datetime.datetime.now().strftime('%I:%M %p')}"
+    if "play" in prompt and "youtube" in prompt:
+        return "I can open YouTube search for that. Say 'search youtube for ...'"
+    if "joke" in prompt:
+        return "Why did the computer show up at work late? It had a hard drive."
+    return "I don't have internet AI access right now — but I can still run local commands or open websites for you."
+
+# ----------------------------
+# Spotify integration (optional)
+# ----------------------------
+spotify_client = None
+def spotify_connect():
+    global spotify_client
+    if not SPOTIFY_AVAILABLE:
+        speak("Spotipy not installed.")
+        return False
+    try:
+        spotify_client = spotipy.Spotify(auth_manager=SpotifyOAuth(
+            scope="user-read-playback-state,user-modify-playback-state,user-read-currently-playing",
+            client_id=os.getenv("SPOTIPY_CLIENT_ID"),
+            client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
+            redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI") or "http://localhost:8888/callback"
+        ))
+        speak("Spotify connected.")
+        return True
+    except Exception as e:
+        print("Spotify connect error:", e)
+        return False
+
+def spotify_play(query):
+    if not spotify_client:
+        if not spotify_connect():
+            speak("Could not connect to Spotify.")
+            return
+    # search and play first track found (requires active device)
+    results = spotify_client.search(q=query, type="track", limit=1)
+    items = results.get("tracks", {}).get("items", [])
+    if items:
+        uri = items[0]["uri"]
+        spotify_client.start_playback(uris=[uri])
+        speak(f"Playing {items[0]['name']} on Spotify.")
+    else:
+        speak("No results found on Spotify.")
+
+# ----------------------------
+# Camera face detection (simple)
+# ----------------------------
+face_detection_running = threading.Event()
+
+def camera_loop():
+    if not CV2_AVAILABLE:
+        print("OpenCV not installed.")
+        return
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Cannot open webcam")
+        return
+    face_detection_running.set()
+    speak("Camera face detection started.")
+    while face_detection_running.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+        for (x,y,w,h) in faces:
+            cv2.rectangle(frame,(x,y),(x+w,y+h),(255,0,0),2)
+        cv2.imshow("Gideon Camera (press q to stop)", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    face_detection_running.clear()
+    cap.release()
+    cv2.destroyAllWindows()
+    speak("Camera stopped.")
+
+# ----------------------------
+# Command processor
+# ----------------------------
+def process_command(cmd):
+    cmd = cmd.lower().strip()
+    print("Processing:", cmd)
+
+    # personality change
+    for p in PERSONALITIES:
+        if f"set personality to {p}" in cmd or f"{p} mode" in cmd:
+            set_personality(p)
+            speak(f"Personality set to {p}.")
+            return
+
+    if "search youtube for" in cmd:
+        q = cmd.split("search youtube for",1)[1].strip()
+        webbrowser.open(f"https://www.youtube.com/results?search_query={q}")
+        speak(f"Searching YouTube for {q}.")
+        return
+
+    if cmd.startswith("search google for") or cmd.startswith("google"):
+        q = cmd.replace("search google for","").replace("google","").strip()
+        webbrowser.open(f"https://www.google.com/search?q={q}")
+        speak(f"Searching Google for {q}.")
+        return
+
+    if "play spotify" in cmd and SPOTIFY_AVAILABLE:
+        q = cmd.replace("play spotify","").strip()
+        spotify_play(q)
+        return
+
+    if "what time" in cmd or "time" == cmd:
+        speak(datetime.datetime.now().strftime("%I:%M %p"))
+        return
+
+    if cmd.startswith("chat:") or cmd.startswith("ask "):
+        prompt = cmd.split(":",1)[1].strip() if ":" in cmd else cmd.replace("ask ","",1).strip()
+        resp = chat_with_gpt(prompt, personality=current_personality)
+        speak(resp)
+        return
+
+    if "start camera" in cmd:
+        if CV2_AVAILABLE:
+            threading.Thread(target=camera_loop, daemon=True).start()
+        else:
+            speak("OpenCV not available.")
+        return
+
+    if "stop camera" in cmd:
+        face_detection_running.clear()
+        return
+
+    if "open" in cmd:
+        # open app / folder / website
+        if "notepad" in cmd:
+            subprocess.Popen(["notepad"])
+            speak("Opening Notepad.")
+            return
+        if "chrome" in cmd or "browser" in cmd:
+            webbrowser.open("https://www.google.com")
+            speak("Opening browser.")
+            return
+
+    # fallback to ChatGPT / local
+    resp = chat_with_gpt(cmd, personality=current_personality)
+    speak(resp)
+
+# ----------------------------
+# GUI (simple) using tkinter
+# ----------------------------
+def start_gui():
+    if not TK_AVAILABLE:
+        print("tkinter not available.")
+        return
+    app = tk.Tk()
+    app.title("Gideon v3")
+    app.geometry("420x300")
+
+    status_var = tk.StringVar(value="Idle")
+    tk.Label(app, text="Gideon v3 Dashboard", font=("Segoe UI", 14)).pack(pady=8)
+    tk.Label(app, textvariable=status_var).pack()
+
+    def on_set_personality(sel):
+        set_personality(sel)
+        status_var.set(f"Personality: {sel}")
+
+    ttk.Button(app, text="Start Wake Listener", command=lambda: start_wake_thread()).pack(pady=6)
+    ttk.Button(app, text="Stop Wake Listener", command=lambda: stop_wake_thread()).pack(pady=6)
+
+    ttk.Label(app, text="Personality:").pack(pady=(10,0))
+    combo = ttk.Combobox(app, values=list(PERSONALITIES.keys()))
+    combo.set(current_personality)
+    combo.bind("<<ComboboxSelected>>", lambda e: on_set_personality(combo.get()))
+    combo.pack()
+
+    ttk.Button(app, text="Run Camera", command=lambda: threading.Thread(target=camera_loop, daemon=True).start()).pack(pady=6)
+
+    def on_close():
+        stop_wake_thread()
+        face_detection_running.clear()
+        stop_threads.set()
+        app.destroy()
+
+    app.protocol("WM_DELETE_WINDOW", on_close)
+    app.mainloop()
+
+# ----------------------------
+# Wake thread control
+# ----------------------------
+wake_thread = None
+def start_wake_thread():
+    global wake_thread
+    if wake_thread and wake_thread.is_alive():
+        return
+    stop_threads.clear()
+    wake_thread = threading.Thread(target=wake_loop, daemon=True)
+    wake_thread.start()
+    threading.Thread(target=main_wake_handler, daemon=True).start()
+    speak("Wake listener started.")
+
+def stop_wake_thread():
+    stop_threads.set()
+    speak("Wake listener stopped.")
+
+# Main handler that waits for wake signals
+def main_wake_handler():
+    while not stop_threads.is_set():
+        try:
+            awaken = wake_queue.get(timeout=1)
+            if awaken:
+                speak("Yes?")
+                # listen longer for command
+                cmd = transcribe_short(duration=4)
+                if cmd:
+                    process_command(cmd)
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print("Wake handler error:", e)
+
+# ----------------------------
+# Entry point
+# ----------------------------
+if __name__ == "__main__":
+    print("Gideon v3 starting...")
+    # start GUI in separate thread so console still usable
+    if TK_AVAILABLE:
+        threading.Thread(target=start_gui, daemon=True).start()
+    start_wake_thread()
+
+    # keep main thread alive
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("Exiting...")
+        stop_threads.set()
+        face_detection_running.clear()
