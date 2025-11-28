@@ -1,0 +1,223 @@
+import speech_recognition as sr
+import pyttsx3
+import random
+import time
+import webbrowser
+import datetime
+import subprocess
+import pywhatkit
+import os
+import pyautogui
+
+
+# Setup
+Engine = pyttsx3.init()
+Recognizer = sr.Recognizer()
+
+
+# Greeting options
+Greetings = [
+   "Greetings. How may I assist you today?",
+   "Awaiting your command, sir.",
+   "System online. Ready for instructions."
+]
+
+
+# Music responses
+MusicResponses = [
+   "Starting your music.",
+   "Let me play some tunes for you.",
+   "Your music is now playing."
+]
+
+
+# Dictionary of top songs and their YouTube links
+TopSongs = {
+   "industry baby": "https://www.youtube.com/watch?v=UTHLKHL_whs",
+   "blinding lights": "https://www.youtube.com/watch?v=4NRXx6U8ABQ",
+   "love by vinny and zai": "https://www.youtube.com/watch?v=ntNsjYK1baQ",
+   "stay": "https://www.youtube.com/watch?v=kJQP7kiw5Fk",
+   "bad habit": "https://www.youtube.com/watch?v=9bZkp7q19f0",
+   "levitating": "https://www.youtube.com/watch?v=T6-9yP9yq5c",
+   "good for you": "https://www.youtube.com/watch?v=gNi_6U5Pm_o",
+   "montero": "https://www.youtube.com/watch?v=6swmTBVI83k",
+   "watermelon sugar": "https://www.youtube.com/watch?v=dZwffaluIgg",
+   "easy on me": "https://www.youtube.com/watch?v=YQHsXMglC9A",
+   "save your tears": "https://www.youtube.com/watch?v=XXYlFuWE7B4",
+   "kiss me more": "https://www.youtube.com/watch?v=0EVVKs6DqX8",
+   "bad guy": "https://www.youtube.com/watch?v=50OaKn9-AvM",
+   "drivers license": "https://www.youtube.com/watch?v=ZmDBbnmKpqY",
+   "peaches": "https://www.youtube.com/watch?v=tQ0yjYUFKAE",
+   "deja vu": "https://www.youtube.com/watch?v=cii6ruuyc1s",
+   "take my breath": "https://www.youtube.com/watch?v=kKj_5u4rKHQ",
+   "cold heart": "https://www.youtube.com/watch?v=J6zvXoT-LjE",
+   "lemonade": "https://www.youtube.com/watch?v=soFMK59taZc",
+   "heartbreak anniversary": "https://www.youtube.com/watch?v=nT2R7bIEmUg",
+   "positions": "https://www.youtube.com/watch?v=tcYodQoapMg",
+   "smokin out the window": "https://www.youtube.com/watch?v=7A4co0axdpI",
+}
+
+
+def Speak(Text):
+   try:
+       print("Gideon:", Text)
+       Engine.say(Text)
+       Engine.runAndWait()
+   except RuntimeError:
+       pass
+
+
+def Listen():
+   with sr.Microphone() as Source:
+       print("🎤 Listening...")
+       Recognizer.adjust_for_ambient_noise(Source, duration=0.5)
+       try:
+           Audio = Recognizer.listen(Source, timeout=10)
+           response = Recognizer.recognize_google(Audio, show_all=True)
+           if isinstance(response, dict) and 'alternative' in response:
+               best_transcript = max(response['alternative'], key=lambda x: x['confidence'])['transcript']
+               print("You said:", best_transcript)
+               return best_transcript.lower()
+           else:
+               print("Error: No valid transcriptions found.")
+               return ""
+       except sr.WaitTimeoutError:
+           print("No audio detected within the time frame.")
+           return ""
+       except Exception as E:
+           print("Error:", E)
+           return ""
+
+
+def CleanCommand(Command):
+   WakeWords = ["hey gideon", "gideon", "hey", "ok gideon"]
+   for WakeWord in WakeWords:
+       Command = Command.replace(WakeWord, "").strip()
+
+
+   UnnecessaryWords = ["can you", "please"]
+   for Word in UnnecessaryWords:
+       Command = Command.replace(Word, "").strip()
+
+
+   print(f"Cleaned Command: {Command}")
+   return Command
+
+
+def PlayMusic(command):
+   songName = command.lower().replace("play", "")
+   songLink = None
+
+
+   for key in TopSongs:
+       if songName.lower() in key.lower() or key.lower() in songName.lower():
+           songLink = TopSongs[key]
+           songName = key  # Use the correct name from the dictionary
+           break
+
+
+   if songLink:
+       Speak(f"Playing {songName} on YouTube.")
+       pywhatkit.playonyt(songLink)
+       save_music_state(songName)  # Save the current song state
+   else:
+       Speak(f"Sorry, I couldn't find {songName} in the playlist. Please try another song.")
+
+
+def save_music_state(song_name):
+   with open("music_state.txt", "w") as file:
+       file.write(song_name)
+
+
+def load_music_state():
+   if os.path.exists("music_state.txt"):
+       with open("music_state.txt", "r") as file:
+           return file.read().strip()
+   return None
+
+
+def PauseMusic():
+   Speak("Pausing the music.")
+   pyautogui.hotkey('space')  # Simulate pressing the spacebar to pause the music
+
+
+def UnpauseMusic():
+   Speak("Unpausing the music.")
+   pyautogui.hotkey('space')  # Simulate pressing the spacebar to unpause the music
+
+
+def AskToContinueMusic():
+   Speak("Would you like me to continue your music?")
+   words = Listen()
+   if "yes" in words:
+       music_state = load_music_state()  # Check if there was a song playing before
+       if music_state:
+           Speak(f"Resuming your music: {music_state}")
+           PlayMusic(music_state)
+       else:
+           Speak("There was no music playing before. Please ask me to play a song.")
+   elif "no" or "no, thank you" in words:
+       Speak("Alright, the music will not continue.")
+   else:
+       Speak("Sorry, I didn't understand that. Please say 'yes' or 'no'.")
+
+
+def ProcessCommand(command):
+   print(f"Processing command: {command}")
+   command = CleanCommand(command)
+   if not command:
+       Speak("Sorry, I didn't catch that. Could you try again?")
+       return True
+
+
+   words = command.split()
+
+
+   if "time" in words:
+       Speak(f"The current time is {datetime.datetime.now().strftime('%I:%M %p')}.")
+   elif "song" in words or "play" in words:
+       PlayMusic(command)
+   elif "pause" in words:
+       PauseMusic()
+   elif "unpause" in words:
+       UnpauseMusic()
+   elif "stop listening" in words:
+       Speak("Alright, shutting down. Call me when you need me.")
+       return False
+   elif "search" in words and "youtube" in words:
+       search_query = " ".join(words[words.index("search")+1:]).replace("youtube", "").replace("for", "").replace("on", "")
+       Speak(f"Searching for {search_query} on YouTube.")
+       webbrowser.open(f"https://www.youtube.com/results?search_query={search_query}")
+   else:
+       Speak("Sorry, I didn't catch that. Could you try again?")
+   return True
+
+
+# Main loop
+while True:
+   try:
+       print("👂 Waiting for wake word...")
+       Heard = Listen()
+
+
+       if "hey gideon" in Heard or "hey" in Heard:
+           Speak(random.choice(Greetings))
+           music_state = load_music_state()  # Check if there was a song playing before
+           if music_state:
+               AskToContinueMusic()  # Ask the user if they want to continue the music
+
+
+           while True:
+               print("Listening for command...")
+               Command = Listen()
+               if Command:
+                   if "stop listening" or “stop” or “shutdown” in Command:
+                       Speak("Alright, shutting down. Call me when you need me.")
+                       break
+                   ProcessCommand(Command)
+   except KeyboardInterrupt:
+       print("Keyboard Interrupt detected. Shutting down gracefully...")
+       Speak("Shutting down. See you later.")
+       Engine.stop()
+       break
+
